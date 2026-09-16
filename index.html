@@ -105,6 +105,51 @@
       height: 100%;
       border: 0;
     }
+    .map.pannable {
+      display: block;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .map.dragging { cursor: grabbing; }
+    .map-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      transform-origin: 0 0;
+    }
+    .map-canvas svg { display: block; }
+    .map-status {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 0.75rem;
+      color: var(--fg-dim);
+    }
+
+    /* ── Zoom controls ── */
+    .map-controls {
+      position: absolute;
+      right: 1.5rem;
+      bottom: 1.5rem;
+      display: none;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .map.pannable .map-controls { display: flex; }
+    .map-controls button {
+      width: 2rem;
+      height: 2rem;
+      background: rgba(255, 255, 255, 0.90);
+      color: var(--fg);
+      border: 1px solid rgba(0, 0, 0, 0.2);
+      font-family: var(--font-body);
+      font-size: 0.875rem;
+      cursor: pointer;
+    }
+    .map-controls button:hover { background: var(--fg); color: var(--bg); }
 
     /* ── Toggle button ── */
     .toggle-btn {
@@ -220,6 +265,7 @@
         justify-content: space-between;
         align-items: center;
       }
+      .map-controls { bottom: 4.5rem; right: 1rem; }
       .site-footer div {
         line-height: 1.5;
       }
@@ -254,11 +300,14 @@
   </header>
 
   <!-- Full-screen map -->
-  <div class="map">
-    <iframe
-      src="https://docs.google.com/drawings/d/1GkcGfQv9kxgrYQMyu0BYGcZya0gIDG_wQ7GsFJEsdzY/preview"
-      allowfullscreen
-    ></iframe>
+  <div class="map" id="map">
+    <div class="map-canvas" id="mapCanvas"></div>
+    <div class="map-status" id="mapStatus">loading strawmap…</div>
+    <div class="map-controls">
+      <button id="zoomIn" aria-label="Zoom in">+</button>
+      <button id="zoomOut" aria-label="Zoom out">−</button>
+      <button id="zoomFit" aria-label="Fit to screen">⤢</button>
+    </div>
   </div>
 
 
@@ -427,6 +476,200 @@
     if (window.location.pathname === '/faq' || window.location.hash === '#faq') {
       openSidebar();
     }
+
+    // ── Map: live SVG export of the Google Drawing, with pan/zoom ──
+    const DRAWING_ID = '1GkcGfQv9kxgrYQMyu0BYGcZya0gIDG_wQ7GsFJEsdzY';
+    const map    = document.getElementById('map');
+    const canvas = document.getElementById('mapCanvas');
+    const status = document.getElementById('mapStatus');
+
+    let svgW = 0, svgH = 0;
+    let scale = 1, tx = 0, ty = 0;
+    let userMoved = false;
+
+    const fitScale = () => Math.min(map.clientWidth / svgW, map.clientHeight / svgH);
+
+    function apply() {
+      const vw = map.clientWidth, vh = map.clientHeight;
+      const w = svgW * scale, h = svgH * scale;
+      // Center the drawing when it's smaller than the viewport, otherwise keep its edges on screen
+      tx = w <= vw ? (vw - w) / 2 : Math.min(0, Math.max(vw - w, tx));
+      ty = h <= vh ? (vh - h) / 2 : Math.min(0, Math.max(vh - h, ty));
+      canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    }
+
+    // Promote to a GPU layer while moving, then drop it so the SVG re-renders crisply
+    let settleTimer;
+    function settle() {
+      canvas.style.willChange = 'transform';
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => { canvas.style.willChange = 'auto'; }, 250);
+    }
+
+    function zoomAt(factor, cx, cy) {
+      const min = fitScale(), max = Math.max(6, min);
+      const next = Math.min(max, Math.max(min, scale * factor));
+      tx = cx - (cx - tx) * (next / scale);
+      ty = cy - (cy - ty) * (next / scale);
+      scale = next;
+      userMoved = true;
+      apply();
+      settle();
+    }
+
+    function fit() {
+      scale = fitScale();
+      userMoved = false;
+      apply();
+    }
+
+    const center = () => [map.clientWidth / 2, map.clientHeight / 2];
+
+    // Trackpad pinch arrives as ctrl+wheel in Chrome and Firefox; plain scrolling pans
+    let inGesture = false;
+    map.addEventListener('wheel', (e) => {
+      if (!svgW) return;
+      e.preventDefault();
+      const r = map.getBoundingClientRect();
+      if (e.ctrlKey || e.metaKey) {
+        if (!inGesture) zoomAt(Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.01)), e.clientX - r.left, e.clientY - r.top);
+      } else {
+        const k = e.deltaMode ? 20 : 1;
+        tx -= e.deltaX * k;
+        ty -= e.deltaY * k;
+        userMoved = true;
+        apply();
+        settle();
+      }
+    }, { passive: false });
+
+    // Safari trackpad pinch
+    let gestureScale = 1;
+    map.addEventListener('gesturestart', (e) => {
+      e.preventDefault();
+      inGesture = true;
+      gestureScale = scale;
+    });
+    map.addEventListener('gesturechange', (e) => {
+      e.preventDefault();
+      if (!svgW || pointers.size > 1) return; // touch pinch is handled by pointer events
+      const r = map.getBoundingClientRect();
+      zoomAt(gestureScale * e.scale / scale, e.clientX - r.left, e.clientY - r.top);
+    });
+    map.addEventListener('gestureend', (e) => {
+      e.preventDefault();
+      inGesture = false;
+    });
+
+    // Drag to pan, two-finger pinch on touch screens
+    const pointers = new Map();
+    let downX = 0, downY = 0, dragged = false;
+
+    map.addEventListener('pointerdown', (e) => {
+      if (!svgW || e.button !== 0 || e.target.closest('.map-controls')) return;
+      pointers.set(e.pointerId, [e.clientX, e.clientY]);
+      if (pointers.size === 1) {
+        downX = e.clientX;
+        downY = e.clientY;
+        dragged = false;
+      }
+    });
+
+    map.addEventListener('pointermove', (e) => {
+      const prev = pointers.get(e.pointerId);
+      if (!prev) return;
+      if (!dragged && Math.hypot(e.clientX - downX, e.clientY - downY) < 5) return;
+      dragged = true;
+      map.classList.add('dragging');
+      if (!map.hasPointerCapture(e.pointerId)) map.setPointerCapture(e.pointerId);
+
+      const r = map.getBoundingClientRect();
+      if (pointers.size === 2) {
+        const other = [...pointers.values()].find((p) => p !== prev);
+        const d0 = Math.hypot(prev[0] - other[0], prev[1] - other[1]);
+        const d1 = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
+        tx += (e.clientX - prev[0]) / 2;
+        ty += (e.clientY - prev[1]) / 2;
+        zoomAt(d0 ? d1 / d0 : 1, (e.clientX + other[0]) / 2 - r.left, (e.clientY + other[1]) / 2 - r.top);
+      } else {
+        tx += e.clientX - prev[0];
+        ty += e.clientY - prev[1];
+        userMoved = true;
+        apply();
+        settle();
+      }
+      pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    });
+
+    function endPointer(e) {
+      pointers.delete(e.pointerId);
+      if (!pointers.size) map.classList.remove('dragging');
+    }
+    map.addEventListener('pointerup', endPointer);
+    map.addEventListener('pointercancel', endPointer);
+
+    // A drag that ends over a link shouldn't open it
+    map.addEventListener('click', (e) => {
+      if (dragged && !e.target.closest('.map-controls')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true);
+    map.addEventListener('dragstart', (e) => e.preventDefault());
+
+    document.getElementById('zoomIn').addEventListener('click', () => zoomAt(1.5, ...center()));
+    document.getElementById('zoomOut').addEventListener('click', () => zoomAt(1 / 1.5, ...center()));
+    document.getElementById('zoomFit').addEventListener('click', fit);
+
+    document.addEventListener('keydown', (e) => {
+      if (!svgW || e.metaKey || e.ctrlKey || e.altKey || sidebar.classList.contains('open')) return;
+      if (e.key === '+' || e.key === '=') zoomAt(1.5, ...center());
+      else if (e.key === '-') zoomAt(1 / 1.5, ...center());
+      else if (e.key === '0') fit();
+    });
+
+    window.addEventListener('resize', () => {
+      if (!svgW) return;
+      if (userMoved) zoomAt(1, ...center());
+      else fit();
+    });
+
+    fetch(`https://docs.google.com/drawings/d/${DRAWING_ID}/export/svg`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.text();
+      })
+      .then((text) => {
+        const svg = new DOMParser().parseFromString(text, 'image/svg+xml').documentElement;
+        if (svg.nodeName !== 'svg') throw new Error('Invalid SVG');
+        svg.querySelectorAll('script, foreignObject').forEach((n) => n.remove());
+
+        // Google wraps every link in a google.com/url redirect; link to the target directly
+        for (const a of svg.querySelectorAll('a')) {
+          let href = a.getAttribute('xlink:href') || a.getAttribute('href') || '';
+          try {
+            const url = new URL(href);
+            if (url.hostname === 'www.google.com' && url.pathname === '/url') href = url.searchParams.get('q') || href;
+          } catch {}
+          if (/^(https?:|mailto:)/i.test(href)) a.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', href);
+          else a.removeAttribute('xlink:href');
+        }
+
+        [, , svgW, svgH] = svg.getAttribute('viewBox').split(/[\s,]+/).map(Number);
+        svg.setAttribute('width', svgW);
+        svg.setAttribute('height', svgH);
+        canvas.appendChild(document.importNode(svg, true));
+        status.remove();
+        map.classList.add('pannable');
+        fit();
+      })
+      .catch((err) => {
+        // Fall back to Google's own viewer
+        console.error('Could not load strawmap SVG:', err);
+        svgW = 0;
+        map.classList.remove('pannable');
+        map.innerHTML = `<iframe src="https://docs.google.com/drawings/d/${DRAWING_ID}/preview" allowfullscreen></iframe>`;
+      });
   </script>
 </body>
 </html>
